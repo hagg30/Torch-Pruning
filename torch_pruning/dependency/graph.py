@@ -221,32 +221,152 @@ class DependencyGraph(object):
         )
 
         visited_node = set()
+        
+        # MoE expert 경계 감지 헬퍼 함수
+        def _get_expert_boundary(module_name):
+            """MoE expert 모듈의 경계를 반환 (예: 'model.layers.0.mlp.experts.5' -> 'model.layers.0.mlp.experts.5')"""
+            # shared_expert, gate, router는 경계로 간주하지 않음 (모든 expert와 연결 가능)
+            if any(keyword in module_name for keyword in ['shared_expert', 'shared_experts', '.gate', '.router']):
+                return None
+                
+            if '.experts.' in module_name or '.expert.' in module_name:
+                # experts.N까지만 반환 (그 아래 서브모듈은 포함하지 않음)
+                parts = module_name.split('.')
+                for i, part in enumerate(parts):
+                    if part in ('experts', 'expert') and 'shared' not in parts[i:i+2]:
+                        if i + 1 < len(parts) and parts[i + 1].isdigit():
+                            return '.'.join(parts[:i + 2])
+            return None
+        
+        def _is_cross_expert_boundary(source_module, target_module):
+            """두 모듈이 서로 다른 expert에 속하는지 확인"""
+            if source_module not in self._module2name or target_module not in self._module2name:
+                return False
+            
+            source_name = self._module2name.get(source_module, '')
+            target_name = self._module2name.get(target_module, '')
+            
+            source_boundary = _get_expert_boundary(source_name)
+            target_boundary = _get_expert_boundary(target_name)
+            
+            # 둘 다 expert 내부에 있고, 서로 다른 expert인 경우
+            # (shared_expert는 boundary가 None이므로 자동으로 제외됨)
+            if source_boundary and target_boundary and source_boundary != target_boundary:
+                return True
+            return False
+        
         def _fix_dependency_graph_non_recursive(dep, idxs, *args):
-            processing_stack = [(dep, idxs)]
-            while len(processing_stack) > 0:
-                dep, idxs = processing_stack.pop(-1)
+            """
+            비재귀적으로 dependency graph를 수정하는 함수.
+            - on-path 상태 추적을 통해 사이클 방지
+            - ElementWise/Slice/Concat/Transpose 등에서 인덱스 변화가 없으면 확장 중단
+            - MoE expert 경계를 넘는 dependency 차단
+            """
+            
+            # ===== 유틸 =====
+            def _normalize_indices(ix):
+                if ix is None:
+                    return ('__NONE__',)
+                try:
+                    if isinstance(ix, torch.Tensor):
+                        if ix.dtype == torch.bool:
+                            ix = ix.nonzero(as_tuple=False).flatten()
+                        ix = ix.reshape(-1).tolist()
+                    if hasattr(ix, 'tolist'):
+                        ix = ix.tolist()
+                    return tuple(int(x.idx) if hasattr(x, 'idx') else int(x) for x in ix)
+                except Exception:
+                    return ('opaque', repr(ix))
+
+            def _state_key(d, ix):
+                hname = getattr(d.handler, "__name__", str(d.handler))
+                oname = type(d.target.module).__name__ if hasattr(d.target, 'module') else str(d.target)
+                return (id(d.target), oname, hname, _normalize_indices(ix))
+
+            def _is_transparent_like(op_name: str) -> bool:
+                return any(k in op_name for k in [
+                    "ElementWise", "Reshape", "View", "Contiguous",
+                    "Identity", "Broadcast", "Transpose", "Slice", "ConcatOp"
+                ])
+
+            # ===== 본체 =====
+            processing_stack = [(dep, idxs, True)]  # (dep, idxs, entering_flag)
+            onpath = set()
+            visited = set()
+            MAX_EXPANSIONS = 200000
+            expansions = 0
+            
+            # root module 저장 (expert 경계 검사용)
+            root_module = dep.target.module if hasattr(dep.target, 'module') else None
+
+            while processing_stack:
+                dep, idxs, entering = processing_stack.pop()
                 node, fn = dep.target, dep.handler
-                visited_node.add(node)
-    
-                for new_dep in node.dependencies:
-                    if new_dep.is_triggered_by(fn):
+                key = _state_key(dep, idxs)
+
+                if entering:
+                    # --- 사이클 차단 ---
+                    if key in onpath or key in visited:
+                        continue
+
+                    onpath.add(key)
+                    visited_node.add(node)
+                    processing_stack.append((dep, idxs, False))  # exit 마커
+
+                    # --- 자식 순회 ---
+                    for new_dep in node.dependencies:
+                        if not new_dep.is_triggered_by(fn):
+                            continue
+                        
+                        # MoE expert 경계 체크
+                        current_module = node.module if hasattr(node, 'module') else None
+                        next_module = new_dep.target.module if hasattr(new_dep.target, 'module') else None
+                        
+                        if current_module and next_module and _is_cross_expert_boundary(current_module, next_module):
+                            # Expert 경계를 넘으면 차단
+                            continue
+
                         new_indices = idxs
                         for mapping in new_dep.index_mapping:
                             if mapping is not None:
                                 new_indices = mapping(new_indices)
 
-                        if len(new_indices) == 0:
+                        if new_indices is None or len(new_indices) == 0:
                             continue
-                        
+
+                        # 인덱스 변화 확인
+                        norm_old = _normalize_indices(idxs)
+                        norm_new = _normalize_indices(new_indices)
+                        new_op_name = type(new_dep.target.module).__name__ if hasattr(new_dep.target, 'module') else ''
+
+                        # --- 무진전 컷오프 ---
+                        if norm_new == norm_old and _is_transparent_like(new_op_name):
+                            group.add_dep(new_dep, new_indices)
+                            continue
+
+                        # --- 확장 한도 검사 ---
+                        expansions += 1
+                        if expansions > MAX_EXPANSIONS:
+                            if self.verbose:
+                                warnings.warn(
+                                    f"Dependency expansion overflow (possible cycle). "
+                                    f"Reached {MAX_EXPANSIONS} expansions. "
+                                    f"This might indicate a complex MoE model or circular dependency."
+                                )
+                            break
+
                         if (new_dep.target in visited_node) and group.has_pruning_op(
                             new_dep, new_indices
                         ):
                             continue
                         else:
                             group.add_dep(new_dep, new_indices)
-                            processing_stack.append(
-                                (new_dep, new_indices)
-                            )
+                            processing_stack.append((new_dep, new_indices, True))
+
+                else:
+                    # --- exit: onpath → visited 이동 ---
+                    onpath.discard(key)
+                    visited.add(key)
 
         _fix_dependency_graph_non_recursive(*group[0])
 
